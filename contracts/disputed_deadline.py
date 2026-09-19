@@ -246,6 +246,19 @@ def _addr_eq(a: Address, b) -> bool:
     return a == b_addr
 
 
+def _to_address(value) -> Address:
+    """Normalize a caller-supplied 'address'-shaped argument to an Address.
+
+    Client-side ABI encoders (genlayer-js, the genlayer CLI) auto-detect any
+    0x-prefixed 40-hex-char string argument and encode it using the GenVM
+    `address` primitive regardless of the declared parameter type being
+    `str` -- so a method typed `address: str` can still receive an already
+    -decoded Address object at runtime, not a string. Address(<Address>)
+    fails, so every view/write that takes a free-form address argument must
+    accept either shape."""
+    return value if isinstance(value, Address) else Address(value)
+
+
 def _sanitize_json_text(text: str) -> str:
     """Strip markdown fences and leading/trailing chatter around a JSON object.
     LLMs routinely wrap JSON in prose or code fences even when told not to."""
@@ -646,23 +659,38 @@ Return ONLY a JSON object exactly like:
             anchor_ok = anchor_ok and present
         if quoted:
             verdict["condition_met"] = bool(verdict["condition_met"] and anchor_ok)
-            verdict["sub_checks"] = (verdict["sub_checks"] + anchor_checks)[:MAX_SUBCHECK_COUNT]
 
         now_ts = self._now_ts()
         return {
             "condition_met": verdict["condition_met"],
             "checked_at": _bucket_ts(now_ts),
-            "sub_checks": verdict["sub_checks"],
+            # LLM-authored sub_checks are free text: names and phrasing vary
+            # between independently-run LLM calls even when both calls reach
+            # the SAME condition_met verdict, so they are stored for
+            # transparency only and must never gate consensus on their own.
+            "llm_sub_checks": verdict["sub_checks"][:MAX_SUBCHECK_COUNT],
+            # anchor_checks are plain-Python string-presence checks: same
+            # condition_text and same fetched page text always produce the
+            # exact same anchor_checks list, so -- unlike the LLM's free
+            # text -- these ARE safe to compare for exact equality.
+            "anchor_checks": anchor_checks,
             "reasoning": verdict["reasoning"],
         }
 
     def _evaluate_llm_content(self, artifact_url: str, condition_text: str) -> dict:
-        """Custom run_nondet_unsafe validator -- code-enforced field-for-field
-        agreement, not an LLM-interpreted 'similar enough' tolerance. Every
-        sub_check name+passed pair must match exactly, and condition_met
-        must match exactly. There is no numeric slack anywhere in this
-        comparison; two independent runs either land on the identical
-        structured result or they disagree and the leader rotates."""
+        """Custom run_nondet_unsafe validator. Consensus is code-enforced on
+        the two fields that are actually reproducible between independent
+        runs: the boolean `condition_met` decision, and the deterministic
+        `anchor_checks` (plain-Python substring presence tests, never
+        LLM-authored). The LLM's free-text `llm_sub_checks` naming/phrasing
+        is NOT compared -- two independent LLM calls routinely reach the
+        same verdict via differently-worded checks, and gating consensus on
+        exact wording match would make every LLM_CONTENT bet spuriously
+        UNDETERMINED regardless of how clear-cut the real answer is. This is
+        still substantive validator-verified consensus, not a format-only
+        check: each validator independently fetches the page and
+        independently asks the LLM, then the DECISION each one reached is
+        compared exactly -- nothing here trusts the leader's answer."""
 
         def leader_fn() -> dict:
             return self._run_content_evaluation(artifact_url, condition_text, adversarial=False)
@@ -689,11 +717,11 @@ Return ONLY a JSON object exactly like:
 
             if bool(leader_out.get("condition_met")) != bool(mine["condition_met"]):
                 return False
-            leader_checks = leader_out.get("sub_checks") or []
-            mine_checks = mine["sub_checks"]
-            if len(leader_checks) != len(mine_checks):
+            leader_anchors = leader_out.get("anchor_checks") or []
+            mine_anchors = mine["anchor_checks"]
+            if len(leader_anchors) != len(mine_anchors):
                 return False
-            for a, b in zip(leader_checks, mine_checks):
+            for a, b in zip(leader_anchors, mine_anchors):
                 if not isinstance(a, dict):
                     return False
                 if str(a.get("name", "")) != str(b.get("name", "")):
@@ -705,6 +733,7 @@ Return ONLY a JSON object exactly like:
         result = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
         if not isinstance(result, dict):
             raise gl.vm.UserError(ERR_LLM + "content evaluation returned a non-dict result")
+        result["sub_checks"] = (result.get("anchor_checks") or []) + (result.get("llm_sub_checks") or [])
         return result
 
     # ---- COND_IMAGE_VISUAL: genuinely nondeterministic, custom validator ---
@@ -772,9 +801,19 @@ Return ONLY a JSON object exactly like:
         }
 
     def _evaluate_image_visual(self, artifact_url: str, condition_text: str, expected_description: str) -> dict:
-        """Same code-enforced exact-match discipline as the LLM-content path;
-        this directly gates a full-pot payout so it gets the strictest
-        comparison available, never a bare label/format check."""
+        """Consensus is code-enforced on the boolean `condition_met` decision
+        field only. Unlike LLM_CONTENT there is no plain-Python anchor layer
+        available for image content (no deterministic string check can be
+        run against pixels), so `sub_checks` here is purely the LLM's own
+        free-text breakdown, stored for transparency but never compared: two
+        independent vision-model calls routinely reach the same verdict
+        through differently-worded sub-checks, and gating consensus on exact
+        wording would make every IMAGE_VISUAL bet spuriously UNDETERMINED
+        regardless of how clear-cut the image actually is. This still is
+        substantive validator-verified consensus, not a format-only check --
+        each validator independently fetches the image and independently
+        runs vision inference, then the DECISION each one reached is
+        compared exactly."""
 
         def leader_fn() -> dict:
             return self._run_visual_evaluation(artifact_url, condition_text, expected_description, adversarial=False)
@@ -795,20 +834,7 @@ Return ONLY a JSON object exactly like:
             except Exception:
                 return False
 
-            if bool(leader_out.get("condition_met")) != bool(mine["condition_met"]):
-                return False
-            leader_checks = leader_out.get("sub_checks") or []
-            mine_checks = mine["sub_checks"]
-            if len(leader_checks) != len(mine_checks):
-                return False
-            for a, b in zip(leader_checks, mine_checks):
-                if not isinstance(a, dict):
-                    return False
-                if str(a.get("name", "")) != str(b.get("name", "")):
-                    return False
-                if bool(a.get("passed")) != bool(b.get("passed")):
-                    return False
-            return True
+            return bool(leader_out.get("condition_met")) == bool(mine["condition_met"])
 
         result = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
         if not isinstance(result, dict):
@@ -1257,14 +1283,14 @@ Return ONLY a JSON object exactly like:
 
     @gl.public.view
     def get_party_bet_ids(self, address: str) -> list:
-        arr = self.party_bet_ids.get(Address(address))
+        arr = self.party_bet_ids.get(_to_address(address))
         if arr is None:
             return []
         return [int(x) for x in arr]
 
     @gl.public.view
     def get_withdrawable(self, address: str) -> int:
-        return int(self.withdrawable_wei.get(Address(address)) or "0")
+        return int(self.withdrawable_wei.get(_to_address(address)) or "0")
 
     @gl.public.view
     def get_activity(self, bet_id: int, offset: int = 0, limit: int = 25) -> list:

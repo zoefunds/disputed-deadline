@@ -16,6 +16,55 @@ See the contract's module docstring in
 [`contracts/disputed_deadline.py`](../contracts/disputed_deadline.py) for the
 full trust-boundary spec this implements.
 
+## Live verification
+
+Deployed and fully exercised on GenLayer StudioNet with real staked GEN
+(0.01 GEN per side). Current verified address:
+
+**`0xc8fe0Ea32E6848b7D5Be9C2Ee331c5d547261463`**
+
+Two earlier deployments (`0x2944cAAbEE8e9749Db837dc544cda7756b14Ed01`,
+`0x477bDf7f31b62Adcf166bB3e07d5603e25781D9d`) surfaced real bugs during live
+testing, fixed in source before the current address:
+
+1. **Address-argument coercion.** `get_withdrawable` / `get_party_bet_ids`
+   crashed on-chain (`TypeError: cannot convert 'Address' object to bytes`).
+   Client-side ABI encoders (genlayer-js, the `genlayer` CLI) auto-detect any
+   0x-prefixed 40-hex-char string argument and encode it as the GenVM
+   `address` primitive regardless of the parameter's declared `str` type, so
+   `Address(address)` received an already-decoded `Address` object instead
+   of a string. Fixed with a `_to_address()` helper that accepts either
+   shape (mirrors the existing `_addr_eq` pattern).
+2. **Over-strict nondeterministic consensus.** The first live `evaluate()`
+   call on an `LLM_CONTENT` bet hit a genuine `MAJORITY_DISAGREE` — not a
+   mock failure. The validator comparison required LLM-generated sub-check
+   *names* (free text) to match exactly between the leader and each
+   validator's independent LLM call; two independent calls routinely reach
+   the same verdict through differently-worded checks, so this made
+   consensus fail almost regardless of how clear-cut the real answer was.
+   Fixed: consensus now compares only the boolean `condition_met` decision
+   field plus the plain-Python deterministic anchor checks (literal
+   substring presence); the LLM's free-text explanation is stored for
+   transparency but no longer gates agreement. Retested live: real
+   validators independently fetched `docs.genlayer.com`, ran independent
+   LLM judgment, and reached genuine `MAJORITY_AGREE`.
+
+Both fixes are covered by `tests/direct/test_disputed_deadline.py`
+(`test_get_withdrawable_accepts_address_object_not_just_str`, and the
+existing adversarial-injection test exercises the anchor-check path).
+
+Live paths confirmed on real StudioNet consensus (all with real GEN, no
+admin/owner writes anywhere in the contract or the test):
+- HTTP_STATUS: real 200-status fetch, validators agreed, correct settlement
+- Early/duplicate `evaluate()`: rejected by 5-6/6 validators independently
+- LLM_CONTENT: real fetch + real LLM judgment, genuine multi-validator
+  agreement on a nuanced verdict
+- Unreachable artifact → one retry → `RESOLVED_INCONCLUSIVE` with both
+  stakes refunded (fund conservation verified: total withdrawable across
+  both parties exactly matched total staked)
+- Pull-based `withdraw()`: succeeded once, correctly rejected on a repeat
+  call (zero-then-transfer ledger enforcement)
+
 ## Pre-deployment checks (already run, re-run after any edit)
 
 ```bash

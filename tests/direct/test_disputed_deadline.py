@@ -474,3 +474,28 @@ def test_withdraw_zeroes_ledger_before_transfer(direct_vm, direct_deploy, direct
     # Second withdraw must find the ledger already zeroed.
     with direct_vm.expect_revert():
         contract.withdraw()
+
+
+# ---------------------------------------------------------------------------
+# Regression: client-side ABI encoders (genlayer-js / the genlayer CLI)
+# auto-detect any 0x-prefixed 40-hex-char string argument and encode it as
+# the GenVM `address` primitive regardless of the declared `str` parameter
+# type. Confirmed live on StudioNet: get_withdrawable/get_party_bet_ids
+# crashed with "TypeError: cannot convert 'Address' object to bytes" because
+# Address(<already-an-Address>) is invalid. _to_address() must accept both
+# shapes.
+# ---------------------------------------------------------------------------
+
+def test_get_withdrawable_accepts_address_object_not_just_str(direct_vm, direct_deploy, direct_alice, direct_bob):
+    contract = direct_deploy(CONTRACT)
+    from genlayer.py.types import Address  # importable only after direct_deploy wires up the SDK stubs
+    bet_id, deadline, _ = _create_active_bet(contract, direct_vm, direct_alice, direct_bob)
+    direct_vm.mock_web(r".*", {"status": 200, "body": "ok"})
+    _warp_seconds(direct_vm, 3700)
+    contract.evaluate(bet_id)
+
+    alice_addr_obj = Address(direct_alice)
+    # Must not raise -- this is exactly the shape a real ABI-decoded call
+    # delivers when the client encodes the argument as an address primitive.
+    assert contract.get_withdrawable(alice_addr_obj) == STAKE * 2
+    assert contract.get_party_bet_ids(alice_addr_obj) == [bet_id]
