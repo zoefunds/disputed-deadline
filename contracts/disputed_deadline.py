@@ -1,6 +1,7 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 
 import datetime
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -41,6 +42,24 @@ from genlayer import *
 #      automatic re-check after a short delay before falling back to a
 #      defined INCONCLUSIVE state that refunds both stakes. There is no
 #      default winner for "we couldn't tell."
+#    - EVIDENCE IS GROUNDED TO THE DEADLINE, not to whenever a transaction
+#      happens to land. For live-status conditions (HTTP_STATUS,
+#      STRING_CONTAINS) -- which check dynamic, current server state and so
+#      can never be hash-locked without defeating their purpose -- evaluate()
+#      is a SINGLE-SHOT check only, callable within a tight
+#      LIVE_CHECK_WINDOW_SECONDS (5 min) after deadline_ts, with NO retry at
+#      all: a retry would just be a second, later fetch of the same mutable
+#      URL, exactly the pattern this primitive must avoid. If that one
+#      attempt is unreachable, the bet settles INCONCLUSIVE immediately.
+#      For content/image conditions (LLM_CONTENT, IMAGE_VISUAL) a separate
+#      commit_snapshot() step -- bound to its own post-deadline window --
+#      pins a validator-agreed SHA-256 of the raw fetched bytes as the
+#      committed evidence. evaluate() then re-fetches and REQUIRES the hash
+#      to still match before judging; any byte-level drift since the
+#      snapshot (i.e. the page/image was edited after being pinned) settles
+#      INCONCLUSIVE immediately rather than judging newer, unpinned content.
+#      Retries never evaluate a different fetch of the same URL once a
+#      snapshot hash is committed.
 #    - Settlement (`_apply_outcome`) contains zero nondet calls. The
 #      nondeterministic step decides a boolean; the deterministic step moves
 #      money. They are architecturally separated in this file.
@@ -65,6 +84,9 @@ ERR_EXPECTED = "EXPECTED: "    # caller mistake / wrong state -> exact match req
 ERR_EXTERNAL = "EXTERNAL: "    # upstream 4xx-style failure -> exact match required
 ERR_TRANSIENT = "TRANSIENT: "  # network/5xx/unreachable -> agree only if both transient
 ERR_LLM = "LLM_ERROR: "        # model output unusable after sanitation -> always disagree
+ERR_EVIDENCE_DRIFTED = "EVIDENCE_DRIFTED: "  # content no longer matches the committed
+                                              # snapshot hash -> exact match required, and
+                                              # NEVER retried against newer URL state
 
 
 # ----------------------------------------------------------------------------
@@ -72,13 +94,17 @@ ERR_LLM = "LLM_ERROR: "        # model output unusable after sanitation -> alway
 # ----------------------------------------------------------------------------
 STATUS_OPEN = 0                     # creator staked side A, awaiting counterparty
 STATUS_ACTIVE = 1                   # both sides staked; artifact/condition/deadline pinned
-STATUS_UNDETERMINED = 2             # first evaluation attempt could not reach the artifact
+STATUS_UNDETERMINED = 2             # an evidence-gathering attempt (live-check fetch, or
+                                     # snapshot fetch) could not reach the artifact; retryable
 STATUS_RESOLVED_CONDITION_MET = 3   # settled: condition-met side wins
 STATUS_RESOLVED_CONDITION_NOT_MET = 4  # settled: condition-not-met side wins
-STATUS_RESOLVED_INCONCLUSIVE = 5    # settled: both retries exhausted or validators
-                                     # never converged -> stake refund
+STATUS_RESOLVED_INCONCLUSIVE = 5    # settled: retries exhausted, window missed, validators
+                                     # never converged, or evidence drifted -> stake refund
 STATUS_CANCELLED = 6                # creator cancelled before a counterparty joined
 STATUS_TIMEOUT_UNJOINED = 7         # nobody joined before the join deadline; creator reclaimed
+STATUS_SNAPSHOTTED = 8              # LLM_CONTENT/IMAGE_VISUAL only: a validator-agreed
+                                     # content hash has been pinned near the deadline;
+                                     # evaluate() now judges ONLY content matching that hash
 
 STATUS_NAMES = {
     STATUS_OPEN: "OPEN",
@@ -89,6 +115,7 @@ STATUS_NAMES = {
     STATUS_RESOLVED_INCONCLUSIVE: "RESOLVED_INCONCLUSIVE",
     STATUS_CANCELLED: "CANCELLED",
     STATUS_TIMEOUT_UNJOINED: "TIMEOUT_UNJOINED",
+    STATUS_SNAPSHOTTED: "SNAPSHOTTED",
 }
 
 # Which side of the claim a staker is on.
@@ -148,10 +175,30 @@ MIN_STAKE_WEI = 10 ** 15  # 0.001 GEN at 18 decimals
 MIN_LEAD_SECONDS = 300              # deadline must be >=5 min in the future at creation
 MAX_JOIN_WINDOW_SECONDS = 2592000   # 30 days max time allowed for a counterparty to join
 DEFAULT_JOIN_WINDOW_SECONDS = 259200  # 3 days default if creator doesn't override
-UNREACHABLE_RETRY_DELAY_SECONDS = 1800   # 30 min before the one automatic re-check
-UNREACHABLE_RETRY_MAX_WAIT_SECONDS = 259200  # 3 days -- if nobody calls the retry by
-                                              # then, anyone may force INCONCLUSIVE instead
-MAX_EVALUATE_ATTEMPTS = 2           # exactly one first attempt + one retry, no more
+
+# Deadline-grounding windows. For live-status conditions (HTTP_STATUS,
+# STRING_CONTAINS) content is expected to be dynamic and can never be
+# hash-locked without defeating the check's purpose, so the ONLY available
+# mitigation is to make the manipulation window as small as practically
+# possible: LIVE_CHECK_WINDOW_SECONDS bounds evaluate() to a single-shot
+# attempt within a few minutes of deadline_ts, with NO retry at all -- a
+# retry would just be a second fresh fetch, i.e. exactly the "evaluate
+# against a newer URL state" pattern this primitive must avoid. If that one
+# attempt is unreachable, the bet settles INCONCLUSIVE immediately rather
+# than waiting for a second, later look at the URL.
+#
+# For content/image conditions (LLM_CONTENT, IMAGE_VISUAL), commit_snapshot()
+# pins a validator-agreed content hash within SNAPSHOT_WINDOW_SECONDS of the
+# deadline; evaluate() is then hash-locked and safe to call at any later
+# time regardless of window, since any drift is caught deterministically.
+LIVE_CHECK_WINDOW_SECONDS = 300     # 5 min after deadline_ts -- single-shot, no retry
+SNAPSHOT_WINDOW_SECONDS = 1800      # 30 min after deadline_ts to commit a content snapshot
+UNREACHABLE_RETRY_DELAY_SECONDS = 300    # delay before the one automatic snapshot re-check
+                                          # (LLM_CONTENT / IMAGE_VISUAL only -- live-status
+                                          # conditions have no retry at all, see above)
+MAX_EVALUATE_ATTEMPTS = 2           # post-snapshot judgment attempts only (LLM/IMAGE);
+                                     # live-status conditions always use exactly 1
+MAX_SNAPSHOT_ATTEMPTS = 2           # exactly one first attempt + one retry, no more
 
 
 # ============================================================================
@@ -189,11 +236,22 @@ class Bet:
     counterparty_deposited_wei: str
 
     evaluate_attempts: u32
-    first_attempt_ts: u64            # 0 until the first evaluate() call
+    first_attempt_ts: u64            # 0 until the first evaluate()/judgment call
     last_checked_at: u64             # ts recorded inside the last structured result
     evaluation_outcome: str          # "" | MET | NOT_MET | UNREACHABLE
     evaluation_reasoning: str
     sub_checks_json: str             # json-encoded list[{name, passed}] evidence trail
+
+    # Deadline-grounded evidence snapshot -- LLM_CONTENT / IMAGE_VISUAL only.
+    # snapshot_content_hash is a validator-agreed sha256 hex digest of the
+    # RAW bytes fetched during commit_snapshot(), captured near the pinned
+    # deadline. evaluate() re-fetches and requires this exact hash to still
+    # match before judging, so content edited after the snapshot can never
+    # be silently substituted in.
+    snapshot_content_hash: str       # "" until committed
+    snapshot_ts: u64                 # 0 until committed
+    snapshot_attempts: u32
+    first_snapshot_attempt_ts: u64   # 0 until the first commit_snapshot() call
 
     resolved_ts: u64                 # 0 until settled
 
@@ -308,6 +366,15 @@ def _coerce_bool(value, field: str) -> bool:
     if text in ("false", "no", "0", "not_met", "unsatisfied", "fail", "failed"):
         return False
     raise gl.vm.UserError(ERR_LLM + f"unrecognized boolean field '{field}': {value!r}")
+
+
+def _sha256_hex(data: bytes) -> str:
+    """Deterministic content fingerprint used to pin evidence to a moment in
+    time. Every validator that fetches byte-identical content computes the
+    exact same digest, which is what makes it safe to compare across
+    independent leader/validator fetches -- and safe to compare a later
+    re-fetch against, to detect any post-snapshot tampering."""
+    return hashlib.sha256(data).hexdigest()
 
 
 def _bucket_ts(ts: int, bucket_seconds: int = 300) -> int:
@@ -456,7 +523,11 @@ class DisputedDeadline(gl.Contract):
             return False  # leader failed, this validator's rerun succeeded -> disagree
         except gl.vm.UserError as exc:
             validator_msg = getattr(exc, "message", None) or str(exc)
-            if validator_msg.startswith(ERR_EXPECTED) or validator_msg.startswith(ERR_EXTERNAL):
+            if (
+                validator_msg.startswith(ERR_EXPECTED)
+                or validator_msg.startswith(ERR_EXTERNAL)
+                or validator_msg.startswith(ERR_EVIDENCE_DRIFTED)
+            ):
                 return validator_msg == leader_msg
             if validator_msg.startswith(ERR_TRANSIENT) and leader_msg.startswith(ERR_TRANSIENT):
                 return True
@@ -537,6 +608,61 @@ class DisputedDeadline(gl.Contract):
         # correct: every validator fetches and checks the same bytes.
         return gl.eq_principle.strict_eq(fetch)
 
+    # ---- Deadline-grounded evidence snapshot (LLM_CONTENT / IMAGE_VISUAL) --
+    #  Pins a validator-agreed sha256 of the RAW fetched bytes near the
+    #  deadline, via strict_eq: every validator must independently fetch
+    #  byte-identical content for consensus to succeed at all, which doubles
+    #  as a genuine "is this content currently stable" check. If the content
+    #  is actively being edited when this runs, validators will observe
+    #  different bytes and naturally fail to reach strict_eq agreement --
+    #  the transaction itself fails with no state change, and the caller
+    #  simply tries again (still bounded by SNAPSHOT_WINDOW_SECONDS at the
+    #  call site in commit_snapshot/retry_snapshot).
+    # ------------------------------------------------------------------
+
+    def _snapshot_hash_page(self, artifact_url: str) -> str:
+        def fetch() -> str:
+            try:
+                response = gl.nondet.web.get(artifact_url)
+            except Exception as exc:  # noqa: BLE001
+                raise gl.vm.UserError(ERR_TRANSIENT + f"fetch failed: {exc}")
+            status = int(getattr(response, "status", getattr(response, "status_code", 0)) or 0)
+            if status >= 500 or status == 0:
+                raise gl.vm.UserError(ERR_TRANSIENT + f"HTTP {status} upstream error")
+            if 400 <= status < 500:
+                raise gl.vm.UserError(ERR_EXTERNAL + f"HTTP {status} client error")
+            body = getattr(response, "body", b"")
+            raw = bytes(body) if isinstance(body, (bytes, bytearray)) else str(body).encode("utf-8")
+            if not raw.strip():
+                raise gl.vm.UserError(ERR_EXTERNAL + "page body was empty")
+            return _sha256_hex(raw)
+
+        return gl.eq_principle.strict_eq(fetch)
+
+    def _snapshot_hash_image(self, artifact_url: str) -> str:
+        def fetch() -> str:
+            try:
+                response = gl.nondet.web.get(artifact_url)
+            except Exception as exc:  # noqa: BLE001
+                raise gl.vm.UserError(ERR_TRANSIENT + f"image fetch failed: {exc}")
+            status = int(getattr(response, "status", getattr(response, "status_code", 0)) or 0)
+            if status >= 500 or status == 0:
+                raise gl.vm.UserError(ERR_TRANSIENT + f"HTTP {status} upstream error")
+            body = getattr(response, "body", None)
+            if 400 <= status < 500 or not isinstance(body, (bytes, bytearray)) or len(body) == 0:
+                raise gl.vm.UserError(ERR_EXTERNAL + f"image not fetchable (status={status})")
+            return _sha256_hex(bytes(body))
+
+        return gl.eq_principle.strict_eq(fetch)
+
+    def _commit_snapshot_hash(self, bet: Bet) -> str:
+        ctype = int(bet.condition_type)
+        if ctype == COND_LLM_CONTENT:
+            return self._snapshot_hash_page(str(bet.artifact_url))
+        if ctype == COND_IMAGE_VISUAL:
+            return self._snapshot_hash_image(str(bet.artifact_url))
+        raise gl.vm.UserError(ERR_EXPECTED + f"condition_type {ctype} does not use snapshots")
+
     # ---- COND_LLM_CONTENT: genuinely nondeterministic, custom validator ----
 
     def _build_content_prompt(self, condition_text: str, page_excerpt: str, adversarial_note: str) -> str:
@@ -610,7 +736,9 @@ Return ONLY a JSON object exactly like:
             "reasoning": _truncate(reasoning, MAX_REASONING_STORED),
         }
 
-    def _run_content_evaluation(self, artifact_url: str, condition_text: str, adversarial: bool) -> dict:
+    def _run_content_evaluation(
+        self, artifact_url: str, condition_text: str, expected_hash: str, adversarial: bool
+    ) -> dict:
         """Runs INSIDE a nondet closure -- fetch + exec_prompt both live
         directly in this method body so they stay one hop from the leader
         closure that calls it."""
@@ -624,9 +752,21 @@ Return ONLY a JSON object exactly like:
         if 400 <= status < 500:
             raise gl.vm.UserError(ERR_EXTERNAL + f"HTTP {status} client error")
         body = getattr(response, "body", b"")
-        text = body.decode("utf-8", errors="replace") if isinstance(body, (bytes, bytearray)) else str(body)
+        raw = bytes(body) if isinstance(body, (bytes, bytearray)) else str(body).encode("utf-8")
+        text = raw.decode("utf-8", errors="replace")
         if not text.strip():
             raise gl.vm.UserError(ERR_EXTERNAL + "page body was empty")
+
+        # Deadline-grounding check: the artifact must still be byte-identical
+        # to what was pinned by commit_snapshot() near the deadline. A
+        # generic, STATIC message (no dynamic hash value inside it) is used
+        # so every validator's independently-fetched (and possibly
+        # differently-drifted) content still raises the exact same string --
+        # required for _handle_nondet_leader_error's exact-match agreement.
+        if expected_hash and _sha256_hex(raw) != expected_hash:
+            raise gl.vm.UserError(
+                ERR_EVIDENCE_DRIFTED + "content no longer matches the committed snapshot"
+            )
 
         adversarial_note = (
             "This is a SECOND, adversarially-framed review -- actively look "
@@ -677,7 +817,7 @@ Return ONLY a JSON object exactly like:
             "reasoning": verdict["reasoning"],
         }
 
-    def _evaluate_llm_content(self, artifact_url: str, condition_text: str) -> dict:
+    def _evaluate_llm_content(self, artifact_url: str, condition_text: str, expected_hash: str) -> dict:
         """Custom run_nondet_unsafe validator. Consensus is code-enforced on
         the two fields that are actually reproducible between independent
         runs: the boolean `condition_met` decision, and the deterministic
@@ -690,22 +830,24 @@ Return ONLY a JSON object exactly like:
         still substantive validator-verified consensus, not a format-only
         check: each validator independently fetches the page and
         independently asks the LLM, then the DECISION each one reached is
-        compared exactly -- nothing here trusts the leader's answer."""
+        compared exactly -- nothing here trusts the leader's answer.
+        `expected_hash` is the bet's committed snapshot hash; every fetch
+        inside this round is checked against it before any judgment runs."""
 
         def leader_fn() -> dict:
-            return self._run_content_evaluation(artifact_url, condition_text, adversarial=False)
+            return self._run_content_evaluation(artifact_url, condition_text, expected_hash, adversarial=False)
 
         def validator_fn(leaders_res: gl.vm.Result) -> bool:
             if not isinstance(leaders_res, gl.vm.Return):
                 return self._handle_nondet_leader_error(
                     leaders_res,
-                    lambda: self._run_content_evaluation(artifact_url, condition_text, adversarial=False),
+                    lambda: self._run_content_evaluation(artifact_url, condition_text, expected_hash, adversarial=False),
                 )
             leader_out = leaders_res.calldata
             if not isinstance(leader_out, dict):
                 return False
             try:
-                mine = self._run_content_evaluation(artifact_url, condition_text, adversarial=False)
+                mine = self._run_content_evaluation(artifact_url, condition_text, expected_hash, adversarial=False)
             except gl.vm.UserError:
                 # Leader produced a concrete verdict; this validator's own
                 # independent rerun could not reproduce ANY verdict to
@@ -765,7 +907,14 @@ Return ONLY a JSON object exactly like:
   "reasoning": "one short paragraph, plain factual, no meta-commentary"
 }}"""
 
-    def _run_visual_evaluation(self, artifact_url: str, condition_text: str, expected_description: str, adversarial: bool) -> dict:
+    def _run_visual_evaluation(
+        self,
+        artifact_url: str,
+        condition_text: str,
+        expected_description: str,
+        expected_hash: str,
+        adversarial: bool,
+    ) -> dict:
         """Runs INSIDE a nondet closure -- image fetch + exec_prompt(images=...)
         both live directly in this method body."""
         try:
@@ -778,6 +927,14 @@ Return ONLY a JSON object exactly like:
         body = getattr(response, "body", None)
         if 400 <= status < 500 or not isinstance(body, (bytes, bytearray)) or len(body) == 0:
             raise gl.vm.UserError(ERR_EXTERNAL + f"image not fetchable (status={status})")
+
+        # Deadline-grounding check -- same rationale as the content path:
+        # the image must still be byte-identical to what commit_snapshot()
+        # pinned near the deadline. Static message, no dynamic hash inside.
+        if expected_hash and _sha256_hex(bytes(body)) != expected_hash:
+            raise gl.vm.UserError(
+                ERR_EVIDENCE_DRIFTED + "content no longer matches the committed snapshot"
+            )
 
         adversarial_note = (
             "This is a SECOND, adversarially-framed review -- actively look "
@@ -800,7 +957,9 @@ Return ONLY a JSON object exactly like:
             "reasoning": verdict["reasoning"],
         }
 
-    def _evaluate_image_visual(self, artifact_url: str, condition_text: str, expected_description: str) -> dict:
+    def _evaluate_image_visual(
+        self, artifact_url: str, condition_text: str, expected_description: str, expected_hash: str
+    ) -> dict:
         """Consensus is code-enforced on the boolean `condition_met` decision
         field only. Unlike LLM_CONTENT there is no plain-Python anchor layer
         available for image content (no deterministic string check can be
@@ -813,22 +972,30 @@ Return ONLY a JSON object exactly like:
         substantive validator-verified consensus, not a format-only check --
         each validator independently fetches the image and independently
         runs vision inference, then the DECISION each one reached is
-        compared exactly."""
+        compared exactly. `expected_hash` is the bet's committed snapshot
+        hash; every fetch inside this round is checked against it before any
+        judgment runs."""
 
         def leader_fn() -> dict:
-            return self._run_visual_evaluation(artifact_url, condition_text, expected_description, adversarial=False)
+            return self._run_visual_evaluation(
+                artifact_url, condition_text, expected_description, expected_hash, adversarial=False
+            )
 
         def validator_fn(leaders_res: gl.vm.Result) -> bool:
             if not isinstance(leaders_res, gl.vm.Return):
                 return self._handle_nondet_leader_error(
                     leaders_res,
-                    lambda: self._run_visual_evaluation(artifact_url, condition_text, expected_description, adversarial=False),
+                    lambda: self._run_visual_evaluation(
+                        artifact_url, condition_text, expected_description, expected_hash, adversarial=False
+                    ),
                 )
             leader_out = leaders_res.calldata
             if not isinstance(leader_out, dict):
                 return False
             try:
-                mine = self._run_visual_evaluation(artifact_url, condition_text, expected_description, adversarial=False)
+                mine = self._run_visual_evaluation(
+                    artifact_url, condition_text, expected_description, expected_hash, adversarial=False
+                )
             except gl.vm.UserError:
                 return False
             except Exception:
@@ -855,10 +1022,15 @@ Return ONLY a JSON object exactly like:
         if ctype == COND_STRING_CONTAINS:
             return self._evaluate_string_contains(str(bet.artifact_url), str(bet.expected_substring))
         if ctype == COND_LLM_CONTENT:
-            return self._evaluate_llm_content(str(bet.artifact_url), str(bet.condition_text))
+            return self._evaluate_llm_content(
+                str(bet.artifact_url), str(bet.condition_text), str(bet.snapshot_content_hash)
+            )
         if ctype == COND_IMAGE_VISUAL:
             return self._evaluate_image_visual(
-                str(bet.artifact_url), str(bet.condition_text), str(bet.expected_image_description)
+                str(bet.artifact_url),
+                str(bet.condition_text),
+                str(bet.expected_image_description),
+                str(bet.snapshot_content_hash),
             )
         raise gl.vm.UserError(ERR_EXPECTED + f"unhandled condition_type {ctype}")
 
@@ -1040,6 +1212,10 @@ Return ONLY a JSON object exactly like:
             evaluation_outcome="",
             evaluation_reasoning="",
             sub_checks_json="[]",
+            snapshot_content_hash="",
+            snapshot_ts=u64(0),
+            snapshot_attempts=u32(0),
+            first_snapshot_attempt_ts=u64(0),
             resolved_ts=u64(0),
         )
 
@@ -1109,45 +1285,136 @@ Return ONLY a JSON object exactly like:
         self._log(bet_id, "TIMEOUT_UNJOINED", gl.message.sender_address, refund, now_ts, "")
 
     # ========================================================================
+    #  PUBLIC WRITES -- evidence snapshot (LLM_CONTENT / IMAGE_VISUAL only)
+    # ========================================================================
+    #  These two condition types reference a document/image whose exact
+    #  byte-content matters. commit_snapshot() is the ONLY place a content
+    #  hash is pinned, and it may only run inside a short window right after
+    #  the deadline -- keeping the pinned evidence genuinely close to T.
+    #  Once pinned, evaluate() is hash-locked and safe to call at any time.
+    # ========================================================================
+
+    @gl.public.write
+    def commit_snapshot(self, bet_id: int) -> dict:
+        """Permissionless: within SNAPSHOT_WINDOW_SECONDS of the pinned
+        deadline, independently fetch the artifact and pin a validator-
+        agreed sha256 of its raw bytes as the committed evidence. Only valid
+        for LLM_CONTENT / IMAGE_VISUAL bets -- HTTP_STATUS / STRING_CONTAINS
+        check live server state directly via evaluate() instead, since their
+        content is expected to be dynamic."""
+        now_ts = self._now_ts()
+        bet = self._get_bet(bet_id)
+        ctype = int(bet.condition_type)
+        _require(ctype in (COND_LLM_CONTENT, COND_IMAGE_VISUAL), "this condition_type does not use commit_snapshot")
+        _require(int(bet.status) == STATUS_ACTIVE, "bet is not awaiting a snapshot")
+        _require(now_ts >= int(bet.deadline_ts), "deadline has not been reached yet")
+        _require(
+            now_ts <= int(bet.deadline_ts) + SNAPSHOT_WINDOW_SECONDS,
+            "snapshot window has closed; call force_inconclusive instead",
+        )
+        _require(int(bet.snapshot_attempts) == 0, "bet has already had its first snapshot attempt; use retry_snapshot")
+
+        return self._run_snapshot_attempt(bet, bet_id, now_ts)
+
+    @gl.public.write
+    def retry_snapshot(self, bet_id: int) -> dict:
+        """Permissionless: the single automatic re-check allowed after an
+        UNDETERMINED snapshot attempt, once UNREACHABLE_RETRY_DELAY_SECONDS
+        has elapsed, still bounded by the overall SNAPSHOT_WINDOW_SECONDS."""
+        now_ts = self._now_ts()
+        bet = self._get_bet(bet_id)
+        ctype = int(bet.condition_type)
+        _require(ctype in (COND_LLM_CONTENT, COND_IMAGE_VISUAL), "this condition_type does not use retry_snapshot")
+        _require(int(bet.status) == STATUS_UNDETERMINED, "bet is not awaiting a snapshot retry")
+        _require(int(bet.snapshot_attempts) < MAX_SNAPSHOT_ATTEMPTS, "retry already used; use force_inconclusive")
+        _require(
+            now_ts >= int(bet.first_snapshot_attempt_ts) + UNREACHABLE_RETRY_DELAY_SECONDS,
+            f"must wait {UNREACHABLE_RETRY_DELAY_SECONDS}s after the first attempt before retrying",
+        )
+        _require(
+            now_ts <= int(bet.deadline_ts) + SNAPSHOT_WINDOW_SECONDS,
+            "snapshot window has closed; call force_inconclusive instead",
+        )
+
+        return self._run_snapshot_attempt(bet, bet_id, now_ts)
+
+    def _run_snapshot_attempt(self, bet: Bet, bet_id: int, now_ts: int) -> dict:
+        bet.snapshot_attempts = u32(int(bet.snapshot_attempts) + 1)
+        if int(bet.first_snapshot_attempt_ts) == 0:
+            bet.first_snapshot_attempt_ts = u64(now_ts)
+
+        try:
+            content_hash = self._commit_snapshot_hash(bet)
+        except gl.vm.UserError as exc:
+            msg = getattr(exc, "message", None) or str(exc)
+            bet.status = u8(STATUS_UNDETERMINED)
+            self._log(bet_id, "SNAPSHOT_UNDETERMINED", gl.message.sender_address, 0, now_ts, msg[:180])
+
+            if int(bet.snapshot_attempts) >= MAX_SNAPSHOT_ATTEMPTS:
+                self._apply_inconclusive_refund(
+                    bet, bet_id, now_ts, "snapshot retry exhausted, artifact still unreachable"
+                )
+                return {"status": "RESOLVED_INCONCLUSIVE", "reason": msg}
+
+            return {
+                "status": "UNDETERMINED",
+                "reason": msg,
+                "retry_after_ts": now_ts + UNREACHABLE_RETRY_DELAY_SECONDS,
+            }
+
+        bet.snapshot_content_hash = content_hash
+        bet.snapshot_ts = u64(_bucket_ts(now_ts))
+        bet.status = u8(STATUS_SNAPSHOTTED)
+        self._log(bet_id, "SNAPSHOT_COMMITTED", gl.message.sender_address, 0, now_ts, content_hash[:32])
+        return {"status": "SNAPSHOTTED", "snapshot_content_hash": content_hash}
+
+    # ========================================================================
     #  PUBLIC WRITES -- evaluation and settlement
     # ========================================================================
 
     @gl.public.write
     def evaluate(self, bet_id: int) -> dict:
-        """Permissionless: at or after the pinned deadline, independently
-        fetch the pinned artifact and evaluate the pinned condition via
-        validator consensus, then settle deterministically. Rejects early
-        calls and calls against an already-terminal bet explicitly. If the
-        artifact is unreachable, records UNDETERMINED and allows exactly one
-        automatic re-check later (see retry_evaluate) before falling back to
-        INCONCLUSIVE via force_inconclusive."""
+        """Permissionless. For HTTP_STATUS / STRING_CONTAINS: a SINGLE-SHOT
+        check, only callable within LIVE_CHECK_WINDOW_SECONDS of the pinned
+        deadline. There is no retry for these two condition types -- content
+        is expected to be dynamic, so any retry would just be a second,
+        later fetch of the same mutable URL, which is exactly the pattern
+        this primitive must avoid. If the one attempt can't reach the
+        artifact, the bet settles INCONCLUSIVE immediately in this same
+        call. For LLM_CONTENT / IMAGE_VISUAL: only callable once
+        commit_snapshot() has pinned a content hash; re-fetches and requires
+        that exact hash to still match before judging -- if the artifact has
+        been edited since the snapshot, this settles INCONCLUSIVE
+        immediately rather than judging the newer, unpinned content. Rejects
+        early calls and calls against an already-terminal bet explicitly."""
         now_ts = self._now_ts()
         bet = self._get_bet(bet_id)
-        _require(int(bet.status) == STATUS_ACTIVE, "bet is not active / already evaluated or settled")
-        _require(now_ts >= int(bet.deadline_ts), "deadline has not been reached yet")
-        _require(int(bet.evaluate_attempts) == 0, "bet has already had its first evaluation attempt; use retry_evaluate")
+        ctype = int(bet.condition_type)
 
-        return self._run_evaluation_attempt(bet, bet_id, now_ts)
+        if ctype in (COND_HTTP_STATUS, COND_STRING_CONTAINS):
+            _require(int(bet.status) == STATUS_ACTIVE, "bet is not active / already evaluated or settled")
+            _require(now_ts >= int(bet.deadline_ts), "deadline has not been reached yet")
+            _require(
+                now_ts <= int(bet.deadline_ts) + LIVE_CHECK_WINDOW_SECONDS,
+                "evaluation window has closed; call force_inconclusive instead",
+            )
+            return self._run_live_check_attempt(bet, bet_id, now_ts)
 
-    @gl.public.write
-    def retry_evaluate(self, bet_id: int) -> dict:
-        """Permissionless: the single automatic re-check allowed after an
-        UNDETERMINED first attempt, once UNREACHABLE_RETRY_DELAY_SECONDS has
-        elapsed. This is the ONLY retry path -- MAX_EVALUATE_ATTEMPTS caps
-        total attempts at 2, so there is no unbounded re-trigger drift and
-        no path to re-run evaluation indefinitely against a moving target."""
-        now_ts = self._now_ts()
-        bet = self._get_bet(bet_id)
-        _require(int(bet.status) == STATUS_UNDETERMINED, "bet is not awaiting a retry")
-        _require(int(bet.evaluate_attempts) < MAX_EVALUATE_ATTEMPTS, "retry already used; use force_inconclusive")
+        # COND_LLM_CONTENT / COND_IMAGE_VISUAL -- hash-locked, no time bound
         _require(
-            now_ts >= int(bet.first_attempt_ts) + UNREACHABLE_RETRY_DELAY_SECONDS,
-            f"must wait {UNREACHABLE_RETRY_DELAY_SECONDS}s after the first attempt before retrying",
+            int(bet.status) == STATUS_SNAPSHOTTED,
+            "bet has no committed snapshot yet; call commit_snapshot first",
         )
+        _require(int(bet.evaluate_attempts) < MAX_EVALUATE_ATTEMPTS, "judgment attempts exhausted; use force_inconclusive")
+        return self._run_judgment_attempt(bet, bet_id, now_ts)
 
-        return self._run_evaluation_attempt(bet, bet_id, now_ts)
-
-    def _run_evaluation_attempt(self, bet: Bet, bet_id: int, now_ts: int) -> dict:
+    def _run_live_check_attempt(self, bet: Bet, bet_id: int, now_ts: int) -> dict:
+        """HTTP_STATUS / STRING_CONTAINS: single deterministic fetch+check,
+        exactly once, bounded to LIVE_CHECK_WINDOW_SECONDS at the call site
+        above. Unreachable settles INCONCLUSIVE immediately -- there is no
+        UNDETERMINED/retry state for this condition family at all, so a
+        second look at a (possibly by-then-edited) URL is structurally
+        impossible."""
         bet.evaluate_attempts = u32(int(bet.evaluate_attempts) + 1)
         if int(bet.first_attempt_ts) == 0:
             bet.first_attempt_ts = u64(now_ts)
@@ -1156,20 +1423,50 @@ Return ONLY a JSON object exactly like:
             result = self._evaluate_condition(bet)
         except gl.vm.UserError as exc:
             msg = getattr(exc, "message", None) or str(exc)
-            bet.status = u8(STATUS_UNDETERMINED)
             bet.evaluation_outcome = EVAL_UNREACHABLE
             bet.evaluation_reasoning = _truncate(msg, MAX_REASONING_STORED)
-            self._log(bet_id, "UNDETERMINED", gl.message.sender_address, 0, now_ts, msg[:180])
+            self._log(bet_id, "LIVE_CHECK_UNREACHABLE", gl.message.sender_address, 0, now_ts, msg[:180])
+            self._apply_inconclusive_refund(bet, bet_id, now_ts, "the single live-status check could not reach the artifact")
+            return {"status": "RESOLVED_INCONCLUSIVE", "reason": msg}
 
-            if int(bet.evaluate_attempts) >= MAX_EVALUATE_ATTEMPTS:
-                # Retry already exhausted on this very attempt -- settle
-                # straight to INCONCLUSIVE rather than requiring a further
-                # call, so funds can never sit stuck behind a silent caller.
-                self._apply_inconclusive_refund(bet, bet_id, now_ts, "retry exhausted, artifact still unreachable")
+        return self._settle_from_result(bet, bet_id, now_ts, result)
+
+    def _run_judgment_attempt(self, bet: Bet, bet_id: int, now_ts: int) -> dict:
+        """LLM_CONTENT / IMAGE_VISUAL, post-snapshot: re-fetch, require the
+        hash to still match the committed snapshot, then judge. A hash
+        mismatch means the artifact was edited after being pinned -- this
+        settles INCONCLUSIVE immediately and is NEVER retried against
+        whatever newer state the URL now holds. A transient/model failure
+        unrelated to drift is retried in place (still SNAPSHOTTED, no time
+        bound needed since content is hash-locked), bounded by attempt
+        count instead."""
+        bet.evaluate_attempts = u32(int(bet.evaluate_attempts) + 1)
+        if int(bet.first_attempt_ts) == 0:
+            bet.first_attempt_ts = u64(now_ts)
+
+        try:
+            result = self._evaluate_condition(bet)
+        except gl.vm.UserError as exc:
+            msg = getattr(exc, "message", None) or str(exc)
+
+            if msg.startswith(ERR_EVIDENCE_DRIFTED):
+                self._log(bet_id, "EVIDENCE_DRIFTED", gl.message.sender_address, 0, now_ts, msg[:180])
+                self._apply_inconclusive_refund(
+                    bet, bet_id, now_ts, "artifact content diverged from the committed snapshot"
+                )
                 return {"status": "RESOLVED_INCONCLUSIVE", "reason": msg}
 
-            return {"status": "UNDETERMINED", "reason": msg, "retry_after_ts": now_ts + UNREACHABLE_RETRY_DELAY_SECONDS}
+            self._log(bet_id, "JUDGMENT_RETRY", gl.message.sender_address, 0, now_ts, msg[:180])
+            if int(bet.evaluate_attempts) >= MAX_EVALUATE_ATTEMPTS:
+                self._apply_inconclusive_refund(bet, bet_id, now_ts, "judgment attempts exhausted after snapshot")
+                return {"status": "RESOLVED_INCONCLUSIVE", "reason": msg}
+            return {"status": "SNAPSHOTTED", "reason": msg}
 
+        return self._settle_from_result(bet, bet_id, now_ts, result)
+
+    def _settle_from_result(self, bet: Bet, bet_id: int, now_ts: int, result: dict) -> dict:
+        """Shared success-path tail for both the live-check and post-snapshot
+        judgment attempts: record the structured result and settle."""
         condition_met = bool(result.get("condition_met"))
         checked_at = int(result.get("checked_at", now_ts))
         sub_checks = result.get("sub_checks") or []
@@ -1194,19 +1491,47 @@ Return ONLY a JSON object exactly like:
 
     @gl.public.write
     def force_inconclusive(self, bet_id: int) -> None:
-        """Permissionless safety valve: if the retry itself was never called
-        within UNREACHABLE_RETRY_MAX_WAIT_SECONDS of the first attempt,
-        anyone may force the bet straight to INCONCLUSIVE (full refund both
-        sides) rather than leaving funds stuck forever behind an
-        uncalled retry."""
+        """Permissionless safety valve covering every way a bet can stall
+        before a terminal state: the live-status evaluation window closed
+        without evaluate() ever being called, the snapshot window closed
+        without a committed hash, or a snapshot retry was never called.
+        (HTTP_STATUS / STRING_CONTAINS have no UNDETERMINED/retry state at
+        all -- a failed single-shot check settles INCONCLUSIVE immediately
+        inside evaluate() itself.) Refunds both sides in full rather than
+        leaving funds stuck or letting an arbitrarily late fetch decide the
+        outcome."""
         now_ts = self._now_ts()
         bet = self._get_bet(bet_id)
-        _require(int(bet.status) == STATUS_UNDETERMINED, "bet is not in an undetermined state")
-        _require(
-            now_ts > int(bet.first_attempt_ts) + UNREACHABLE_RETRY_MAX_WAIT_SECONDS,
-            "retry window has not been exhausted yet",
-        )
-        self._apply_inconclusive_refund(bet, bet_id, now_ts, "retry window exhausted without a retry call")
+        status = int(bet.status)
+        ctype = int(bet.condition_type)
+
+        if status == STATUS_ACTIVE and ctype in (COND_HTTP_STATUS, COND_STRING_CONTAINS):
+            _require(
+                now_ts > int(bet.deadline_ts) + LIVE_CHECK_WINDOW_SECONDS,
+                "evaluation window has not closed yet",
+            )
+            self._apply_inconclusive_refund(bet, bet_id, now_ts, "evaluation window closed, evaluate() was never called")
+            return
+
+        if status == STATUS_ACTIVE and ctype in (COND_LLM_CONTENT, COND_IMAGE_VISUAL):
+            _require(
+                now_ts > int(bet.deadline_ts) + SNAPSHOT_WINDOW_SECONDS,
+                "snapshot window has not closed yet",
+            )
+            self._apply_inconclusive_refund(
+                bet, bet_id, now_ts, "snapshot window closed, commit_snapshot() was never called"
+            )
+            return
+
+        if status == STATUS_UNDETERMINED and ctype in (COND_LLM_CONTENT, COND_IMAGE_VISUAL):
+            _require(
+                now_ts > int(bet.deadline_ts) + SNAPSHOT_WINDOW_SECONDS,
+                "snapshot window has not closed yet",
+            )
+            self._apply_inconclusive_refund(bet, bet_id, now_ts, "snapshot window closed without a retry call")
+            return
+
+        raise gl.vm.UserError(ERR_EXPECTED + "bet is not in a state force_inconclusive applies to")
 
     # ========================================================================
     #  PUBLIC WRITES -- pull-based withdrawal (the only function that ever
@@ -1260,6 +1585,10 @@ Return ONLY a JSON object exactly like:
             "evaluation_outcome": bet.evaluation_outcome,
             "evaluation_reasoning": bet.evaluation_reasoning,
             "sub_checks": sub_checks,
+            "snapshot_content_hash": bet.snapshot_content_hash,
+            "snapshot_ts": int(bet.snapshot_ts),
+            "snapshot_attempts": int(bet.snapshot_attempts),
+            "first_snapshot_attempt_ts": int(bet.first_snapshot_attempt_ts),
             "resolved_ts": int(bet.resolved_ts),
         }
 
@@ -1333,8 +1662,10 @@ Return ONLY a JSON object exactly like:
             "min_lead_seconds": MIN_LEAD_SECONDS,
             "default_join_window_seconds": DEFAULT_JOIN_WINDOW_SECONDS,
             "max_join_window_seconds": MAX_JOIN_WINDOW_SECONDS,
+            "live_check_window_seconds": LIVE_CHECK_WINDOW_SECONDS,
+            "snapshot_window_seconds": SNAPSHOT_WINDOW_SECONDS,
             "unreachable_retry_delay_seconds": UNREACHABLE_RETRY_DELAY_SECONDS,
-            "unreachable_retry_max_wait_seconds": UNREACHABLE_RETRY_MAX_WAIT_SECONDS,
             "max_evaluate_attempts": MAX_EVALUATE_ATTEMPTS,
+            "max_snapshot_attempts": MAX_SNAPSHOT_ATTEMPTS,
             "condition_types": list(CONDITION_TYPE_FROM_NAME.keys()),
         }

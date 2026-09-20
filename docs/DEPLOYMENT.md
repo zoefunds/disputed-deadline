@@ -16,54 +16,70 @@ See the contract's module docstring in
 [`contracts/disputed_deadline.py`](../contracts/disputed_deadline.py) for the
 full trust-boundary spec this implements.
 
-## Live verification
+## Current verified deployment
 
-Deployed and fully exercised on GenLayer StudioNet with real staked GEN
-(0.01 GEN per side). Current verified address:
+**`0x151b73847663116eab8822749031d56Fb86a82bE`** — GenLayer StudioNet.
 
-**`0xc8fe0Ea32E6848b7D5Be9C2Ee331c5d547261463`**
+This is the fourth deployment. See [`REVIEW.md`](../REVIEW.md) at the repo
+root for the full history of what an external review flagged, the root
+cause of each issue, and how each was fixed and re-verified live. In short:
 
-Two earlier deployments (`0x2944cAAbEE8e9749Db837dc544cda7756b14Ed01`,
-`0x477bDf7f31b62Adcf166bB3e07d5603e25781D9d`) surfaced real bugs during live
-testing, fixed in source before the current address:
+1. An address-argument coercion crash in two view functions — fixed.
+2. An over-strict consensus comparison on the LLM/vision paths that made
+   real validator agreement fail almost regardless of the correct answer —
+   fixed.
+3. **Settlement not grounded to the pinned deadline** — the finding that
+   forced this deployment. `evaluate()` used to fetch the artifact whenever
+   the transaction happened to land, with no upper bound, so a mutable page
+   could be edited between the deadline and an arbitrarily later call. Fixed
+   with two different mechanisms depending on condition type (below).
 
-1. **Address-argument coercion.** `get_withdrawable` / `get_party_bet_ids`
-   crashed on-chain (`TypeError: cannot convert 'Address' object to bytes`).
-   Client-side ABI encoders (genlayer-js, the `genlayer` CLI) auto-detect any
-   0x-prefixed 40-hex-char string argument and encode it as the GenVM
-   `address` primitive regardless of the parameter's declared `str` type, so
-   `Address(address)` received an already-decoded `Address` object instead
-   of a string. Fixed with a `_to_address()` helper that accepts either
-   shape (mirrors the existing `_addr_eq` pattern).
-2. **Over-strict nondeterministic consensus.** The first live `evaluate()`
-   call on an `LLM_CONTENT` bet hit a genuine `MAJORITY_DISAGREE` — not a
-   mock failure. The validator comparison required LLM-generated sub-check
-   *names* (free text) to match exactly between the leader and each
-   validator's independent LLM call; two independent calls routinely reach
-   the same verdict through differently-worded checks, so this made
-   consensus fail almost regardless of how clear-cut the real answer was.
-   Fixed: consensus now compares only the boolean `condition_met` decision
-   field plus the plain-Python deterministic anchor checks (literal
-   substring presence); the LLM's free-text explanation is stored for
-   transparency but no longer gates agreement. Retested live: real
-   validators independently fetched `docs.genlayer.com`, ran independent
-   LLM judgment, and reached genuine `MAJORITY_AGREE`.
+## How evidence is grounded to the deadline (current design)
 
-Both fixes are covered by `tests/direct/test_disputed_deadline.py`
-(`test_get_withdrawable_accepts_address_object_not_just_str`, and the
-existing adversarial-injection test exercises the anchor-check path).
+The fix is condition-type-specific, because "the artifact" means two
+different things depending on what's being checked:
 
-Live paths confirmed on real StudioNet consensus (all with real GEN, no
-admin/owner writes anywhere in the contract or the test):
-- HTTP_STATUS: real 200-status fetch, validators agreed, correct settlement
-- Early/duplicate `evaluate()`: rejected by 5-6/6 validators independently
-- LLM_CONTENT: real fetch + real LLM judgment, genuine multi-validator
-  agreement on a nuanced verdict
-- Unreachable artifact → one retry → `RESOLVED_INCONCLUSIVE` with both
-  stakes refunded (fund conservation verified: total withdrawable across
-  both parties exactly matched total staked)
-- Pull-based `withdraw()`: succeeded once, correctly rejected on a repeat
-  call (zero-then-transfer ledger enforcement)
+### Live-status conditions — `HTTP_STATUS`, `STRING_CONTAINS`
+
+These check *current, dynamic* server state ("is my demo up right now") and
+can never be hash-locked without defeating their own purpose. The
+mitigation here is to make the window in which that live check can happen
+as small as practically possible, and to remove retries entirely:
+
+- `evaluate(bet_id)` is a **single-shot, permissionless** call, only valid
+  inside `LIVE_CHECK_WINDOW_SECONDS` (5 minutes) of `deadline_ts`.
+- There is **no retry function** for these two condition types. A retry
+  would just be a second, later fetch of the same mutable URL — exactly the
+  pattern that must be avoided. If the one attempt can't reach the artifact,
+  the bet settles `RESOLVED_INCONCLUSIVE` **in that same call**.
+- Miss the 5-minute window entirely (nobody called `evaluate` at all)?
+  Anyone may call `force_inconclusive(bet_id)` to refund both sides.
+
+This does not make manipulation *impossible* — a party could still edit
+their page within that 5-minute window — but it shrinks the exploitable
+window from "unbounded" to "as tight as the primitive's own liveness
+semantics allow." This tradeoff, and why it can't be eliminated further
+without changing what these two condition types mean, is documented in
+`REVIEW.md`.
+
+### Content/image conditions — `LLM_CONTENT`, `IMAGE_VISUAL`
+
+These reference a document or image whose *exact byte content* matters, so
+they get a much stronger guarantee: a two-phase snapshot-then-judge flow.
+
+1. **`commit_snapshot(bet_id)`** — permissionless, only within
+   `SNAPSHOT_WINDOW_SECONDS` (30 minutes) of `deadline_ts`. Every validator
+   independently fetches the artifact and computes its SHA-256; consensus
+   (`strict_eq`) requires them to all get the *exact same bytes*, which
+   doubles as a genuine "is this content currently stable" check. On
+   success, the hash is pinned to the bet (`status` → `SNAPSHOTTED`).
+   Unreachable? One retry via `retry_snapshot(bet_id)` after a short delay,
+   still bounded by the same window; exhausted → `RESOLVED_INCONCLUSIVE`.
+2. **`evaluate(bet_id)`** — only valid once `SNAPSHOTTED`, and **no longer
+   time-bound** at all, because it's hash-locked instead: it re-fetches and
+   requires the content to still hash to the pinned value before judging.
+   Any drift since the snapshot → `RESOLVED_INCONCLUSIVE` immediately,
+   **never** judged against the newer, unpinned content.
 
 ## Pre-deployment checks (already run, re-run after any edit)
 
@@ -75,16 +91,9 @@ pytest tests/direct/ -v
 ```
 
 All four currently pass clean (0 lint errors, 0 typecheck errors, valid ABI
-schema, 22/22 direct tests). A clean `schema` extraction is what prevents the
+schema, 31/31 direct tests). A clean `schema` extraction is what prevents the
 StudioNet "could not load contract schema" deploy-time error — if you modify
 the contract, re-run it before deploying.
-
-## Deploying (GenLayer Studio UI)
-
-1. Open GenLayer Studio, connect a StudioNet wallet funded with test GEN.
-2. Upload `contracts/disputed_deadline.py` as a new contract.
-3. Deploy with no constructor arguments (`__init__` takes none).
-4. Note the deployed contract address — you'll need it for every call below.
 
 ## Deploying (genlayer-cli)
 
@@ -93,6 +102,7 @@ genlayer deploy --contract contracts/disputed_deadline.py --network studionet
 ```
 
 Follow the CLI's interactive prompts for the funded account to deploy from.
+(StudioNet is gasless — a 0 GEN balance does not block deploy or writes.)
 
 ## Core interaction flow
 
@@ -113,11 +123,14 @@ create_bet(
 )
 ```
 Attach the stake as the transaction's native value (GEN). Returns `bet_id`.
+`join_window_seconds` must close well before `deadline_ts`, and
+`deadline_ts` itself must leave enough room for the relevant check window
+below (5 min for live-status types, 30 min for content/image types).
 
 **Condition type selection:**
-- `HTTP_STATUS` / `STRING_CONTAINS` — fully deterministic, no LLM call, cheapest and most reliable. Use whenever the claim reduces to a status code or a literal substring.
-- `LLM_CONTENT` — the fetched page needs interpretation beyond a substring match (e.g. "the page's UI shows the feature is live").
-- `IMAGE_VISUAL` — `artifact_url` must resolve directly to image bytes; validators run vision interpretation against `expected_image_description`.
+- `HTTP_STATUS` / `STRING_CONTAINS` — fully deterministic, no LLM call, cheapest and most reliable. Use whenever the claim reduces to a status code or a literal substring, and the check is genuinely about *live* server state.
+- `LLM_CONTENT` — the fetched page needs interpretation beyond a substring match (e.g. "the page's UI shows the feature is live"). Content is hash-locked once snapshotted.
+- `IMAGE_VISUAL` — `artifact_url` must resolve directly to image bytes; validators run vision interpretation against `expected_image_description`. Also hash-locked once snapshotted.
 
 ### 2. Counterparty joins (matches the stake exactly)
 
@@ -128,35 +141,42 @@ Attach exactly the same GEN amount as the creator staked. This pins the bet
 into `ACTIVE` — `artifact_url` / `condition_text` / `deadline_ts` become
 immutable from this point on.
 
-### 3. Wait for the deadline, then evaluate (anyone can call)
+### 3a. HTTP_STATUS / STRING_CONTAINS — evaluate within 5 minutes of the deadline
 
 ```
 evaluate(bet_id)
 ```
-Reverts if called before `deadline_ts`. Runs validator consensus over the
-pinned artifact/condition and settles deterministically. Returns
-`{status, condition_met, sub_checks}` (or `{status: "UNDETERMINED", ...}` if
-the artifact was unreachable).
+Reverts if called before `deadline_ts` or more than `LIVE_CHECK_WINDOW_SECONDS`
+(5 min) after it. Single-shot: settles `RESOLVED_CONDITION_MET`,
+`RESOLVED_CONDITION_NOT_MET`, or — if the artifact couldn't be reached —
+`RESOLVED_INCONCLUSIVE`, all in this one call. There is no retry function
+for these condition types. Missed the window entirely? Call
+`force_inconclusive(bet_id)` instead.
 
-### 4. If UNDETERMINED: one automatic retry
+### 3b. LLM_CONTENT / IMAGE_VISUAL — snapshot, then judge
 
 ```
-retry_evaluate(bet_id)   # only after UNREACHABLE_RETRY_DELAY_SECONDS (30 min)
+commit_snapshot(bet_id)     # within 30 min of deadline_ts
 ```
-If this also fails to reach the artifact, the bet auto-settles to
-`RESOLVED_INCONCLUSIVE` (full refund both sides) — no third attempt exists.
+Pins a validator-agreed content hash. If unreachable, wait a short delay
+and call `retry_snapshot(bet_id)` (one retry, still bounded by the 30-minute
+window); if that also fails, the bet auto-settles `RESOLVED_INCONCLUSIVE`.
+Missed the window without ever snapshotting? Call `force_inconclusive(bet_id)`.
 
-If nobody calls `retry_evaluate` at all within
-`UNREACHABLE_RETRY_MAX_WAIT_SECONDS` (3 days) of the first attempt, anyone
-may call:
+Once `SNAPSHOTTED`:
 ```
-force_inconclusive(bet_id)
+evaluate(bet_id)
 ```
+No longer time-bound. Re-fetches, requires the content hash to still match,
+then runs LLM/vision judgment. A hash mismatch settles
+`RESOLVED_INCONCLUSIVE` immediately (evidence drifted, never judged against
+the newer state). A transient/model hiccup unrelated to drift may be
+retried by calling `evaluate` again (bounded by attempt count, not time).
 
-### 5. Withdraw your balance (pull-based, not automatic)
+### 4. Withdraw your balance (pull-based, not automatic)
 
 Settlement only credits an internal ledger — nobody's wallet is touched by
-`evaluate`/`retry_evaluate` itself. Each party must withdraw:
+`evaluate`/`commit_snapshot` themselves. Each party must withdraw:
 
 ```
 withdraw()
@@ -168,12 +188,14 @@ Pays out the caller's entire `withdrawable_wei` balance and zeroes it first.
 ```
 cancel_bet(bet_id)               # creator only, before anyone joins
 timeout_unjoined_reclaim(bet_id) # anyone, after join_deadline_ts if nobody joined
+force_inconclusive(bet_id)       # anyone, once the relevant window has closed
+                                  # without a terminal outcome
 ```
 
 ## Views (read-only, free)
 
 ```
-get_bet(bet_id)              # full bet record
+get_bet(bet_id)              # full bet record, including snapshot_content_hash
 get_bet_summary(bet_id)      # status/stake/outcome only
 get_bet_count()
 get_party_bet_ids(address)   # bets an address is party to
@@ -191,26 +213,23 @@ Run the direct-mode suite (fast, no network, no validator consensus):
 pytest tests/direct/ -v
 ```
 
-It covers: min-stake/lead-time validation, join/cancel/timeout lifecycle,
-both deterministic condition types (met + not-met), LLM-content evaluation,
-the adversarial-content-injection mitigation (deterministic anchor layer
-overriding a manipulated LLM verdict), image-visual evaluation, the
-unreachable → retry → INCONCLUSIVE path, early/duplicate `evaluate()`
-rejection, the "no self-reported evidence function exists" structural
-guarantee, and fund conservation across every terminal path.
+31 tests cover: min-stake/lead-time validation, join/cancel/timeout
+lifecycle, both deterministic condition types (met + not-met), the
+single-shot no-retry live-status window, LLM-content evaluation, the
+adversarial-content-injection mitigation, image-visual evaluation, the
+commit_snapshot → evaluate hash-lock flow for both content/image types, the
+evidence-drift → immediate-INCONCLUSIVE path (the exact scenario the
+deadline-grounding review finding described), early/duplicate `evaluate()`
+rejection, structural guarantees (no self-reported evidence function, no
+retry function for live-status types), and fund conservation across every
+terminal path.
 
 Direct mode does **not** exercise real validator disagreement/consensus
-rotation — that requires an integration-mode run against a live GenLayer
-network with multiple validators, which is what you'll be doing once you
-deploy to StudioNet and hand me the contract address.
+rotation — that requires a live GenLayer network with multiple validators,
+which is what every deployment above has been tested against on StudioNet.
 
 ## What to send back after deployment
 
-Once you deploy, send me:
-1. The deployed contract address
-2. The network (StudioNet)
-
-I'll then run through the interaction flow above end-to-end with real GEN
-stakes to confirm: bet creation, joining, deadline enforcement, evaluation
-consensus on at least the `HTTP_STATUS` and one nondeterministic condition
-type, the INCONCLUSIVE/retry path, and pull-based withdrawal.
+Once you deploy, send the deployed contract address and confirm the
+network (StudioNet). Full interaction flow above can then be exercised
+end-to-end with real GEN stakes.
